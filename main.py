@@ -77,6 +77,7 @@ class TransactionResponse(BaseModel):
     amount: Decimal
     type: str
     created_at: datetime
+    other_account_email: Optional[str] = None  # Email de l'autre compte impliqué
 
 class BankAccountResponse(BaseModel):
     balance: Decimal
@@ -142,6 +143,54 @@ async def get_current_user(token: str = Depends(oauth2_scheme), session: Session
     if user is None:
         raise credentials_exception
     return user
+
+def get_enriched_transactions(session: Session, transactions: List[Transaction], current_user_email: str) -> List[TransactionResponse]:
+    enriched_transactions = []
+    for t in transactions:
+        other_email = None
+        if t.type == "withdrawal":
+            # Pour un retrait (transfert envoyé), chercher la transaction de dépôt correspondante
+            related_deposit = (
+                session.query(Transaction)
+                .join(BankAccount)
+                .join(User)
+                .filter(
+                    Transaction.type == "deposit",
+                    Transaction.amount == t.amount,
+                    Transaction.created_at == t.created_at
+                )
+                .with_entities(User.email)
+                .first()
+            )
+            if related_deposit:
+                other_email = related_deposit[0]
+        elif t.type == "deposit":
+            # Pour un dépôt (transfert reçu), chercher la transaction de retrait correspondante
+            related_withdrawal = (
+                session.query(Transaction)
+                .join(BankAccount)
+                .join(User)
+                .filter(
+                    Transaction.type == "withdrawal",
+                    Transaction.amount == t.amount,
+                    Transaction.created_at == t.created_at
+                )
+                .with_entities(User.email)
+                .first()
+            )
+            if related_withdrawal:
+                other_email = related_withdrawal[0]
+        
+        enriched_transactions.append(
+            TransactionResponse(
+                id=t.id,
+                amount=t.amount,
+                type=t.type,
+                created_at=t.created_at,
+                other_account_email=other_email
+            )
+        )
+    return enriched_transactions
 
 @app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register_user(user: UserCreate, session: Session = Depends(get_session)):
@@ -210,20 +259,24 @@ async def read_users_me(
     session: Session = Depends(get_session)
 ):
     bank_account = session.query(BankAccount).filter(BankAccount.user_id == current_user.id).first()
+    
+    # Récupérer les transactions triées par date décroissante
+    transactions = (
+        session.query(Transaction)
+        .filter(Transaction.account_id == bank_account.id)
+        .order_by(Transaction.created_at.desc())
+        .all()
+    )
+    
+    enriched_transactions = get_enriched_transactions(session, transactions, current_user.email)
+    
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
         account=BankAccountResponse(
             balance=bank_account.balance,
             created_at=bank_account.created_at,
-            transactions=[
-                TransactionResponse(
-                    id=t.id,
-                    amount=t.amount,
-                    type=t.type,
-                    created_at=t.created_at
-                ) for t in bank_account.transactions
-            ]
+            transactions=enriched_transactions
         )
     )
 
@@ -238,19 +291,11 @@ def list_users(session: Session = Depends(get_session)):
                 account=BankAccountResponse(
                     balance=user.account.balance,
                     created_at=user.account.created_at,
-                    transactions=[
-                        TransactionResponse(
-                            id=t.id,
-                            amount=t.amount,
-                            type=t.type,
-                            created_at=t.created_at
-                        ) for t in user.account.transactions
-                    ]
+                    transactions=get_enriched_transactions(session, user.account.transactions, user.email)
                 )
             ) for user in users
         ]
     except Exception as e:
-        print(f"Erreur lors de la récupération des utilisateurs: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Erreur lors de la récupération des utilisateurs"
@@ -368,18 +413,22 @@ async def transfer_money(
                 detail="Solde insuffisant pour effectuer ce transfert"
             )
         
+        now = datetime.utcnow()
+        
         # Créer la transaction de débit
         debit_transaction = Transaction(
             amount=transfer.amount,
             type="withdrawal",
-            account_id=source_account.id
+            account_id=source_account.id,
+            created_at=now
         )
         
         # Créer la transaction de crédit
         credit_transaction = Transaction(
             amount=transfer.amount,
             type="deposit",
-            account_id=destination_account.id
+            account_id=destination_account.id,
+            created_at=now
         )
         
         # Mettre à jour les soldes
@@ -391,9 +440,15 @@ async def transfer_money(
         session.add(credit_transaction)
         session.commit()
         
-        # Rafraîchir les données
-        session.refresh(source_account)
-        session.refresh(debit_transaction)
+        # Récupérer les transactions triées par date décroissante
+        transactions = (
+            session.query(Transaction)
+            .filter(Transaction.account_id == source_account.id)
+            .order_by(Transaction.created_at.desc())
+            .all()
+        )
+        
+        enriched_transactions = get_enriched_transactions(session, transactions, current_user.email)
         
         return UserResponse(
             id=current_user.id,
@@ -401,14 +456,7 @@ async def transfer_money(
             account=BankAccountResponse(
                 balance=source_account.balance,
                 created_at=source_account.created_at,
-                transactions=[
-                    TransactionResponse(
-                        id=t.id,
-                        amount=t.amount,
-                        type=t.type,
-                        created_at=t.created_at
-                    ) for t in source_account.transactions
-                ]
+                transactions=enriched_transactions
             )
         )
         
