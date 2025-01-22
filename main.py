@@ -47,6 +47,7 @@ class BankAccount(SQLModel, table=True):
     balance: Decimal = Field(default=Decimal("0.00"), decimal_places=2)
     iban: str = Field(default=None, unique=True, index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    closed_at: Optional[datetime] = Field(default=None)  # Date de clôture du compte
     user_id: Optional[int] = Field(default=None, foreign_key="user.id")
     user: Optional["User"] = Relationship(back_populates="account")
     transactions: List["Transaction"] = Relationship(back_populates="account")
@@ -581,6 +582,10 @@ async def transfer_money(
         credit_transaction.related_transaction_id = debit_transaction.id
         session.commit()
         
+        # Vérifier que les comptes ne sont pas clôturés
+        await check_account_not_closed(source_account)
+        await check_account_not_closed(recipient_account)
+        
         return [
             TransactionResponse(
                 id=debit_transaction.id,
@@ -836,4 +841,213 @@ async def internal_transfer(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors du transfert interne: {str(e)}"
+        )
+
+@app.delete("/account/{account_id}/close", response_model=UserResponse)
+async def close_account(
+    account_id: int,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    try:
+        # Récupérer le compte à clôturer
+        account_to_close = (
+            session.query(BankAccount)
+            .filter(
+                BankAccount.id == account_id,
+                BankAccount.user_id == current_user.id
+            )
+            .first()
+        )
+
+        if not account_to_close:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Compte non trouvé"
+            )
+
+        # Vérifier que ce n'est pas le compte principal
+        if account_to_close.account_type == "principal":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Le compte principal ne peut pas être clôturé"
+            )
+
+        # Vérifier si le compte n'est pas déjà clôturé
+        if account_to_close.closed_at:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Ce compte est déjà clôturé"
+            )
+
+        # Vérifier s'il y a des transactions en cours (non finalisées)
+        pending_transactions = (
+            session.query(Transaction)
+            .filter(
+                Transaction.account_id == account_id,
+                Transaction.can_cancel_until != None  # Transactions qui peuvent encore être annulées
+            )
+            .first()
+        )
+
+        if pending_transactions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Ce compte a des transactions en cours et ne peut pas être clôturé"
+            )
+
+        # Récupérer le compte principal
+        main_account = (
+            session.query(BankAccount)
+            .filter(
+                BankAccount.user_id == current_user.id,
+                BankAccount.account_type == "principal"
+            )
+            .first()
+        )
+
+        if not main_account:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Compte principal non trouvé"
+            )
+
+        # Transférer le solde vers le compte principal
+        if account_to_close.balance > 0:
+            now = datetime.utcnow()
+            
+            # Créer les transactions de transfert
+            withdrawal = Transaction(
+                amount=account_to_close.balance,
+                type="account_closure_withdrawal",
+                account_id=account_to_close.id,
+                created_at=now
+            )
+            
+            deposit = Transaction(
+                amount=account_to_close.balance,
+                type="account_closure_deposit",
+                account_id=main_account.id,
+                created_at=now
+            )
+            
+            # Mettre à jour les soldes
+            main_account.balance += account_to_close.balance
+            account_to_close.balance = Decimal("0.00")
+            
+            session.add(withdrawal)
+            session.add(deposit)
+
+        # Marquer le compte comme clôturé
+        account_to_close.closed_at = datetime.utcnow()
+        
+        session.commit()
+
+        # Récupérer les transactions du compte principal pour la réponse
+        transactions = (
+            session.query(Transaction)
+            .filter(Transaction.account_id == main_account.id)
+            .order_by(Transaction.created_at.desc())
+            .all()
+        )
+
+        enriched_transactions = get_enriched_transactions(session, transactions, current_user.email)
+
+        return UserResponse(
+            id=current_user.id,
+            email=current_user.email,
+            accounts=[
+                BankAccountResponse(
+                    id=main_account.id,
+                    account_type=main_account.account_type,
+                    balance=main_account.balance,
+                    iban=main_account.iban,
+                    created_at=main_account.created_at,
+                    transactions=enriched_transactions
+                )
+            ]
+        )
+
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        print(f"Erreur lors de la clôture du compte: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors de la clôture du compte: {str(e)}"
+        )
+
+async def check_account_not_closed(account: BankAccount):
+    if account.closed_at:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ce compte est clôturé et ne peut plus être utilisé pour des transactions"
+        )
+
+@app.post("/deposit", response_model=UserResponse)
+async def deposit_money(
+    transaction: TransactionCreate,
+    account_id: int,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    try:
+        account = session.query(BankAccount).filter(
+            BankAccount.id == account_id,
+            BankAccount.user_id == current_user.id
+        ).first()
+        
+        # Vérifier que le compte n'est pas clôturé
+        await check_account_not_closed(account)
+        
+        # Créer la transaction
+        new_transaction = Transaction(
+            amount=transaction.amount,
+            type="deposit",
+            account_id=account.id
+        )
+        session.add(new_transaction)
+        
+        # Mettre à jour le solde
+        account.balance += transaction.amount
+        
+        session.commit()
+        session.refresh(account)
+        session.refresh(new_transaction)
+        
+        return UserResponse(
+            id=current_user.id,
+            email=current_user.email,
+            accounts=[
+                BankAccountResponse(
+                    id=account.id,
+                    account_type=account.account_type,
+                    balance=account.balance,
+                    iban=account.iban,
+                    created_at=account.created_at,
+                    transactions=[
+                        TransactionResponse(
+                            id=t.id,
+                            amount=t.amount,
+                            type=t.type,
+                            created_at=t.created_at
+                        ) for t in account.transactions
+                    ]
+                ) for account in current_user.accounts
+            ]
+        )
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        print(f"Erreur lors du dépôt: {str(e)}")
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors du dépôt: {str(e)}"
         )
