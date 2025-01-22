@@ -28,7 +28,7 @@ Une API bancaire moderne et sécurisée construite avec FastAPI, offrant des fon
 
 1. Clonez le repository :
 ```bash
-git clone https://github.com/votre-username/bankai.git
+git clone https://github.com/elcrmt/bankai
 cd bankai
 ```
 
