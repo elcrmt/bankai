@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, status, Security
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlmodel import Session, create_engine, SQLModel, Field, Relationship
+from sqlalchemy.orm import joinedload
 from pydantic import EmailStr, BaseModel, condecimal
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -19,7 +20,7 @@ connect_args = {"check_same_thread": False}
 engine = create_engine(sqlite_url, connect_args=connect_args, echo=True)
 
 # Configuration JWT
-SECRET_KEY = "votre_clé_secrète_très_longue_et_complexe"  # Dans un vrai projet, utilisez une variable d'environnement
+SECRET_KEY = "votre_clé_secrète_très_longue_et_complexe"  
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -46,21 +47,24 @@ class BankAccount(SQLModel, table=True):
     balance: Decimal = Field(default=Decimal("0.00"), decimal_places=2)
     iban: str = Field(default=None, unique=True, index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    closed_at: Optional[datetime] = Field(default=None)  # Date de clôture du compte
     user_id: Optional[int] = Field(default=None, foreign_key="user.id")
-    user: Optional["User"] = Relationship(back_populates="accounts")
+    user: Optional["User"] = Relationship(back_populates="account")
     transactions: List["Transaction"] = Relationship(back_populates="account")
 
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    email: EmailStr = Field(unique=True, index=True)
+    email: str = Field(unique=True, index=True)
     password: str
-    accounts: List[BankAccount] = Relationship(back_populates="user")
+    account: Optional[BankAccount] = Relationship(back_populates="user", sa_relationship_kwargs={"uselist": False})
 
 class Transaction(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     amount: Decimal = Field(decimal_places=2)
-    type: str = Field(max_length=20)  # "deposit" ou "withdrawal"
+    type: str = Field(max_length=20)  # "transfer_sent", "transfer_received", "cancellation_sent", "cancellation_received"
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    can_cancel_until: Optional[datetime] = Field(default=None)
+    related_transaction_id: Optional[int] = Field(default=None)
     account_id: int = Field(foreign_key="bankaccount.id")
     account: "BankAccount" = Relationship(back_populates="transactions")
 
@@ -80,6 +84,7 @@ class TransactionResponse(BaseModel):
     amount: Decimal
     type: str
     created_at: datetime
+    can_cancel_until: Optional[datetime] = None
     other_account_email: Optional[str] = None  # Email de l'autre compte impliqué
 
 class BankAccountCreate(BaseModel):
@@ -329,30 +334,53 @@ async def read_users_me(
         ]
     )
 
-@app.get("/users", response_model=list[UserResponse])
+@app.get("/users", response_model=List[UserResponse])
 def list_users(session: Session = Depends(get_session)):
     try:
+        # Charger les utilisateurs avec leurs comptes
         users = session.query(User).all()
-        return [
-            UserResponse(
-                id=user.id,
-                email=user.email,
-                accounts=[
+        
+        user_responses = []
+        for user in users:
+            # Préparer la réponse pour chaque utilisateur
+            account_responses = []
+            if user.account:
+                # Charger les transactions si le compte existe
+                transactions = (
+                    session.query(Transaction)
+                    .filter(Transaction.account_id == user.account.id)
+                    .order_by(Transaction.created_at.desc())
+                    .all()
+                )
+                
+                enriched_transactions = get_enriched_transactions(session, transactions, user.email)
+                
+                account_responses.append(
                     BankAccountResponse(
-                        id=account.id,
-                        account_type=account.account_type,
-                        balance=account.balance,
-                        iban=account.iban,
-                        created_at=account.created_at,
-                        transactions=get_enriched_transactions(session, account.transactions, user.email)
-                    ) for account in user.accounts
-                ]
-            ) for user in users
-        ]
+                        id=user.account.id,
+                        account_type=user.account.account_type,
+                        balance=user.account.balance,
+                        iban=user.account.iban,
+                        created_at=user.account.created_at,
+                        transactions=enriched_transactions
+                    )
+                )
+            
+            user_responses.append(
+                UserResponse(
+                    id=user.id,
+                    email=user.email,
+                    accounts=account_responses
+                )
+            )
+        
+        return user_responses
+        
     except Exception as e:
+        print(f"Erreur détaillée lors de la récupération des utilisateurs: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Erreur lors de la récupération des utilisateurs"
+            detail=f"Erreur lors de la récupération des utilisateurs: {str(e)}"
         )
 
 @app.post("/account", response_model=BankAccountResponse)
@@ -521,13 +549,15 @@ async def transfer_money(
             )
         
         now = datetime.utcnow()
+        cancel_until = now + timedelta(seconds=5)
         
         # Créer les transactions
         debit_transaction = Transaction(
             amount=transfer.amount,
             type="transfer_sent",
             account_id=source_account.id,
-            created_at=now
+            created_at=now,
+            can_cancel_until=cancel_until
         )
         
         credit_transaction = Transaction(
@@ -548,12 +578,21 @@ async def transfer_money(
         session.refresh(debit_transaction)
         session.refresh(credit_transaction)
         
+        # Lier les transactions
+        credit_transaction.related_transaction_id = debit_transaction.id
+        session.commit()
+        
+        # Vérifier que les comptes ne sont pas clôturés
+        await check_account_not_closed(source_account)
+        await check_account_not_closed(recipient_account)
+        
         return [
             TransactionResponse(
                 id=debit_transaction.id,
                 amount=debit_transaction.amount,
                 type=debit_transaction.type,
-                created_at=debit_transaction.created_at
+                created_at=debit_transaction.created_at,
+                can_cancel_until=debit_transaction.can_cancel_until
             ),
             TransactionResponse(
                 id=credit_transaction.id,
@@ -563,14 +602,134 @@ async def transfer_money(
             )
         ]
         
-    except HTTPException as e:
+    except HTTPException:
         session.rollback()
-        raise e
+        raise
     except Exception as e:
         session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors du transfert: {str(e)}"
+        )
+
+@app.post("/cancel-transfer/{transaction_id}", response_model=List[TransactionResponse])
+async def cancel_transfer(
+    transaction_id: int,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    try:
+        # Récupérer la transaction originale
+        transaction = (
+            session.query(Transaction)
+            .join(BankAccount)
+            .filter(
+                Transaction.id == transaction_id,
+                Transaction.type == "transfer_sent",
+                BankAccount.user_id == current_user.id
+            )
+            .first()
+        )
+
+        if not transaction:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Transaction non trouvée ou vous n'êtes pas autorisé à l'annuler"
+            )
+
+        # Vérifier le délai d'annulation
+        now = datetime.utcnow()
+        if not transaction.can_cancel_until or now > transaction.can_cancel_until:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Le délai d'annulation est dépassé"
+            )
+
+        # Récupérer la transaction liée
+        related_transaction = (
+            session.query(Transaction)
+            .filter(Transaction.related_transaction_id == transaction.id)
+            .first()
+        )
+
+        if not related_transaction:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Transaction liée non trouvée"
+            )
+
+        # Récupérer les comptes
+        source_account = (
+            session.query(BankAccount)
+            .filter(BankAccount.id == transaction.account_id)
+            .first()
+        )
+
+        destination_account = (
+            session.query(BankAccount)
+            .filter(BankAccount.id == related_transaction.account_id)
+            .first()
+        )
+
+        # Vérifier les fonds
+        if destination_account.balance < transaction.amount:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Le destinataire n'a plus les fonds suffisants"
+            )
+
+        # Créer les transactions d'annulation
+        cancellation_sent = Transaction(
+            amount=transaction.amount,
+            type="cancellation_sent",
+            account_id=destination_account.id,
+            created_at=now,
+            related_transaction_id=transaction.id
+        )
+
+        cancellation_received = Transaction(
+            amount=transaction.amount,
+            type="cancellation_received",
+            account_id=source_account.id,
+            created_at=now,
+            related_transaction_id=transaction.id
+        )
+
+        # Mettre à jour les soldes
+        source_account.balance += transaction.amount
+        destination_account.balance -= transaction.amount
+
+        # Désactiver l'annulation
+        transaction.can_cancel_until = None
+
+        # Sauvegarder
+        session.add(cancellation_sent)
+        session.add(cancellation_received)
+        session.commit()
+
+        return [
+            TransactionResponse(
+                id=cancellation_sent.id,
+                amount=cancellation_sent.amount,
+                type=cancellation_sent.type,
+                created_at=cancellation_sent.created_at
+            ),
+            TransactionResponse(
+                id=cancellation_received.id,
+                amount=cancellation_received.amount,
+                type=cancellation_received.type,
+                created_at=cancellation_received.created_at
+            )
+        ]
+
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors de l'annulation: {str(e)}"
         )
 
 @app.post("/transfer/internal", response_model=UserResponse)
@@ -682,4 +841,213 @@ async def internal_transfer(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors du transfert interne: {str(e)}"
+        )
+
+@app.delete("/account/{account_id}/close", response_model=UserResponse)
+async def close_account(
+    account_id: int,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    try:
+        # Récupérer le compte à clôturer
+        account_to_close = (
+            session.query(BankAccount)
+            .filter(
+                BankAccount.id == account_id,
+                BankAccount.user_id == current_user.id
+            )
+            .first()
+        )
+
+        if not account_to_close:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Compte non trouvé"
+            )
+
+        # Vérifier que ce n'est pas le compte principal
+        if account_to_close.account_type == "principal":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Le compte principal ne peut pas être clôturé"
+            )
+
+        # Vérifier si le compte n'est pas déjà clôturé
+        if account_to_close.closed_at:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Ce compte est déjà clôturé"
+            )
+
+        # Vérifier s'il y a des transactions en cours (non finalisées)
+        pending_transactions = (
+            session.query(Transaction)
+            .filter(
+                Transaction.account_id == account_id,
+                Transaction.can_cancel_until != None  # Transactions qui peuvent encore être annulées
+            )
+            .first()
+        )
+
+        if pending_transactions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Ce compte a des transactions en cours et ne peut pas être clôturé"
+            )
+
+        # Récupérer le compte principal
+        main_account = (
+            session.query(BankAccount)
+            .filter(
+                BankAccount.user_id == current_user.id,
+                BankAccount.account_type == "principal"
+            )
+            .first()
+        )
+
+        if not main_account:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Compte principal non trouvé"
+            )
+
+        # Transférer le solde vers le compte principal
+        if account_to_close.balance > 0:
+            now = datetime.utcnow()
+            
+            # Créer les transactions de transfert
+            withdrawal = Transaction(
+                amount=account_to_close.balance,
+                type="account_closure_withdrawal",
+                account_id=account_to_close.id,
+                created_at=now
+            )
+            
+            deposit = Transaction(
+                amount=account_to_close.balance,
+                type="account_closure_deposit",
+                account_id=main_account.id,
+                created_at=now
+            )
+            
+            # Mettre à jour les soldes
+            main_account.balance += account_to_close.balance
+            account_to_close.balance = Decimal("0.00")
+            
+            session.add(withdrawal)
+            session.add(deposit)
+
+        # Marquer le compte comme clôturé
+        account_to_close.closed_at = datetime.utcnow()
+        
+        session.commit()
+
+        # Récupérer les transactions du compte principal pour la réponse
+        transactions = (
+            session.query(Transaction)
+            .filter(Transaction.account_id == main_account.id)
+            .order_by(Transaction.created_at.desc())
+            .all()
+        )
+
+        enriched_transactions = get_enriched_transactions(session, transactions, current_user.email)
+
+        return UserResponse(
+            id=current_user.id,
+            email=current_user.email,
+            accounts=[
+                BankAccountResponse(
+                    id=main_account.id,
+                    account_type=main_account.account_type,
+                    balance=main_account.balance,
+                    iban=main_account.iban,
+                    created_at=main_account.created_at,
+                    transactions=enriched_transactions
+                )
+            ]
+        )
+
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        print(f"Erreur lors de la clôture du compte: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors de la clôture du compte: {str(e)}"
+        )
+
+async def check_account_not_closed(account: BankAccount):
+    if account.closed_at:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ce compte est clôturé et ne peut plus être utilisé pour des transactions"
+        )
+
+@app.post("/deposit", response_model=UserResponse)
+async def deposit_money(
+    transaction: TransactionCreate,
+    account_id: int,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    try:
+        account = session.query(BankAccount).filter(
+            BankAccount.id == account_id,
+            BankAccount.user_id == current_user.id
+        ).first()
+        
+        # Vérifier que le compte n'est pas clôturé
+        await check_account_not_closed(account)
+        
+        # Créer la transaction
+        new_transaction = Transaction(
+            amount=transaction.amount,
+            type="deposit",
+            account_id=account.id
+        )
+        session.add(new_transaction)
+        
+        # Mettre à jour le solde
+        account.balance += transaction.amount
+        
+        session.commit()
+        session.refresh(account)
+        session.refresh(new_transaction)
+        
+        return UserResponse(
+            id=current_user.id,
+            email=current_user.email,
+            accounts=[
+                BankAccountResponse(
+                    id=account.id,
+                    account_type=account.account_type,
+                    balance=account.balance,
+                    iban=account.iban,
+                    created_at=account.created_at,
+                    transactions=[
+                        TransactionResponse(
+                            id=t.id,
+                            amount=t.amount,
+                            type=t.type,
+                            created_at=t.created_at
+                        ) for t in account.transactions
+                    ]
+                ) for account in current_user.accounts
+            ]
+        )
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        print(f"Erreur lors du dépôt: {str(e)}")
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors du dépôt: {str(e)}"
         )
