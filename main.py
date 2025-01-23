@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, Security
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlmodel import Session, create_engine, SQLModel, Field, Relationship
 from sqlalchemy.orm import joinedload
+from sqlalchemy import UniqueConstraint
 from pydantic import EmailStr, BaseModel, condecimal
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -57,6 +58,19 @@ class User(SQLModel, table=True):
     email: str = Field(unique=True, index=True)
     password: str
     account: Optional[BankAccount] = Relationship(back_populates="user", sa_relationship_kwargs={"uselist": False})
+    beneficiaries: List["Beneficiary"] = Relationship(back_populates="user")
+
+class Beneficiary(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(index=True)
+    iban: str = Field(index=True)
+    user_id: int = Field(foreign_key="user.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    user: "User" = Relationship(back_populates="beneficiaries")
+    
+    __table_args__ = (
+        UniqueConstraint('user_id', 'iban', name='unique_user_beneficiary'),
+    )
 
 class Transaction(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -102,6 +116,16 @@ class UserResponse(BaseModel):
     id: int
     email: str
     accounts: List[BankAccountResponse]
+
+class BeneficiaryCreate(BaseModel):
+    name: str = Field(min_length=1)
+    iban: str
+
+class BeneficiaryResponse(BaseModel):
+    id: int
+    name: str
+    iban: str
+    created_at: datetime
 
 class Token(BaseModel):
     access_token: str
@@ -977,6 +1001,132 @@ async def close_account(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors de la clôture du compte: {str(e)}"
+        )
+
+@app.post("/beneficiaries", response_model=BeneficiaryResponse)
+async def add_beneficiary(
+    beneficiary: BeneficiaryCreate,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    try:
+        # Vérifier que le bénéficiaire n'est pas un compte de l'utilisateur
+        user_accounts = session.query(BankAccount).filter(
+            BankAccount.user_id == current_user.id
+        ).all()
+        
+        if any(account.iban == beneficiary.iban for account in user_accounts):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Vous ne pouvez pas ajouter votre propre compte comme bénéficiaire"
+            )
+        
+        # Vérifier que le compte du bénéficiaire existe
+        beneficiary_account = session.query(BankAccount).filter(
+            BankAccount.iban == beneficiary.iban
+        ).first()
+        
+        if not beneficiary_account:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Le compte bénéficiaire n'existe pas"
+            )
+        
+        # Vérifier que le bénéficiaire n'est pas déjà ajouté
+        existing_beneficiary = session.query(Beneficiary).filter(
+            Beneficiary.user_id == current_user.id,
+            Beneficiary.iban == beneficiary.iban
+        ).first()
+        
+        if existing_beneficiary:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Ce bénéficiaire est déjà dans votre liste"
+            )
+        
+        # Créer le bénéficiaire
+        new_beneficiary = Beneficiary(
+            name=beneficiary.name,
+            iban=beneficiary.iban,
+            user_id=current_user.id
+        )
+        
+        session.add(new_beneficiary)
+        session.commit()
+        session.refresh(new_beneficiary)
+        
+        return BeneficiaryResponse(
+            id=new_beneficiary.id,
+            name=new_beneficiary.name,
+            iban=new_beneficiary.iban,
+            created_at=new_beneficiary.created_at
+        )
+        
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors de l'ajout du bénéficiaire: {str(e)}"
+        )
+
+@app.get("/beneficiaries", response_model=List[BeneficiaryResponse])
+async def list_beneficiaries(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    try:
+        beneficiaries = session.query(Beneficiary).filter(
+            Beneficiary.user_id == current_user.id
+        ).order_by(Beneficiary.name).all()
+        
+        return [
+            BeneficiaryResponse(
+                id=b.id,
+                name=b.name,
+                iban=b.iban,
+                created_at=b.created_at
+            ) for b in beneficiaries
+        ]
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors de la récupération des bénéficiaires: {str(e)}"
+        )
+
+@app.delete("/beneficiaries/{beneficiary_id}")
+async def delete_beneficiary(
+    beneficiary_id: int,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    try:
+        beneficiary = session.query(Beneficiary).filter(
+            Beneficiary.id == beneficiary_id,
+            Beneficiary.user_id == current_user.id
+        ).first()
+        
+        if not beneficiary:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Bénéficiaire non trouvé"
+            )
+        
+        session.delete(beneficiary)
+        session.commit()
+        
+        return {"message": "Bénéficiaire supprimé avec succès"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors de la suppression du bénéficiaire: {str(e)}"
         )
 
 async def check_account_not_closed(account: BankAccount):
