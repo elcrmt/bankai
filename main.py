@@ -465,32 +465,27 @@ async def deposit_money(
     session: Session = Depends(get_session)
 ):
     try:
-        # Récupérer le compte bancaire de l'utilisateur
-        bank_account = (
-            session.query(BankAccount)
-            .filter(BankAccount.id == account_id, BankAccount.user_id == current_user.id)
-            .first()
-        )
+        account = session.query(BankAccount).filter(
+            BankAccount.id == account_id,
+            BankAccount.user_id == current_user.id
+        ).first()
         
-        if not bank_account:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Compte bancaire non trouvé"
-            )
+        # Vérifier que le compte n'est pas clôturé
+        await check_account_not_closed(account)
         
         # Créer la transaction
         new_transaction = Transaction(
             amount=transaction.amount,
             type="deposit",
-            account_id=bank_account.id
+            account_id=account.id
         )
         session.add(new_transaction)
         
         # Mettre à jour le solde
-        bank_account.balance += transaction.amount
+        account.balance += transaction.amount
         
         session.commit()
-        session.refresh(bank_account)
+        session.refresh(account)
         session.refresh(new_transaction)
         
         return UserResponse(
@@ -511,8 +506,8 @@ async def deposit_money(
                             created_at=t.created_at
                         ) for t in account.transactions
                     ]
-                ) for account in current_user.accounts
-            ]
+                )
+            ]  # Removed the for loop here since we only have one account
         )
         
     except ValueError as e:
@@ -1134,70 +1129,4 @@ async def check_account_not_closed(account: BankAccount):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Ce compte est clôturé et ne peut plus être utilisé pour des transactions"
-        )
-
-@app.post("/deposit", response_model=UserResponse)
-async def deposit_money(
-    transaction: TransactionCreate,
-    account_id: int,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session)
-):
-    try:
-        account = session.query(BankAccount).filter(
-            BankAccount.id == account_id,
-            BankAccount.user_id == current_user.id
-        ).first()
-        
-        # Vérifier que le compte n'est pas clôturé
-        await check_account_not_closed(account)
-        
-        # Créer la transaction
-        new_transaction = Transaction(
-            amount=transaction.amount,
-            type="deposit",
-            account_id=account.id
-        )
-        session.add(new_transaction)
-        
-        # Mettre à jour le solde
-        account.balance += transaction.amount
-        
-        session.commit()
-        session.refresh(account)
-        session.refresh(new_transaction)
-        
-        return UserResponse(
-            id=current_user.id,
-            email=current_user.email,
-            accounts=[
-                BankAccountResponse(
-                    id=account.id,
-                    account_type=account.account_type,
-                    balance=account.balance,
-                    iban=account.iban,
-                    created_at=account.created_at,
-                    transactions=[
-                        TransactionResponse(
-                            id=t.id,
-                            amount=t.amount,
-                            type=t.type,
-                            created_at=t.created_at
-                        ) for t in account.transactions
-                    ]
-                ) for account in current_user.accounts
-            ]
-        )
-        
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-    except Exception as e:
-        print(f"Erreur lors du dépôt: {str(e)}")
-        session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur lors du dépôt: {str(e)}"
         )
