@@ -11,6 +11,7 @@ import os
 from typing import Optional, List
 from decimal import Decimal
 import random
+from fastapi.middleware.cors import CORSMiddleware
 
 # Configuration de la base de données
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -149,6 +150,15 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI()
 
+# Configuration CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Autoriser le frontend React
+    allow_credentials=True,
+    allow_methods=["*"],  # Autoriser toutes les méthodes HTTP
+    allow_headers=["*"],  # Autoriser tous les headers
+)
+
 @app.on_event("startup")
 async def on_startup():
     create_db_and_tables()
@@ -249,54 +259,91 @@ def generate_iban():
 @app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register_user(user: UserCreate, session: Session = Depends(get_session)):
     try:
+        print(f"Tentative d'inscription pour l'email: {user.email}")
+        
         # Vérifier si l'email existe déjà
-        if session.query(User).filter(User.email == user.email).first():
+        existing_user = session.query(User).filter(User.email == user.email).first()
+        if existing_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Un utilisateur avec cet email existe déjà"
+                detail="Cet email est déjà utilisé"
             )
         
+        print("Hachage du mot de passe...")
         # Hasher le mot de passe
         hashed_password = pwd_context.hash(user.password)
         
-        # Créer l'utilisateur
-        db_user = User(
+        print("Création de l'utilisateur...")
+        # Créer le nouvel utilisateur
+        new_user = User(
             email=user.email,
             password=hashed_password
         )
-        session.add(db_user)
-        session.commit()
-        session.refresh(db_user)
+        session.add(new_user)
+        session.flush()  # Pour obtenir l'ID de l'utilisateur
         
-        # Créer le compte bancaire principal avec IBAN
-        bank_account = BankAccount(
-            user_id=db_user.id,
+        print(f"Utilisateur créé avec l'ID: {new_user.id}")
+        print("Création du compte bancaire...")
+        
+        # Créer un compte principal avec 100€
+        iban = generate_iban()
+        print(f"IBAN généré: {iban}")
+        
+        new_account = BankAccount(
             account_type="principal",
             balance=Decimal("100.00"),
-            iban=generate_iban()
+            iban=iban,
+            user_id=new_user.id
         )
-        session.add(bank_account)
-        session.commit()
-        session.refresh(bank_account)
+        session.add(new_account)
+        session.flush()
         
+        print(f"Compte bancaire créé avec l'ID: {new_account.id}")
+        print("Création de la transaction initiale...")
+        
+        # Créer une transaction initiale pour le solde de 100€
+        initial_transaction = Transaction(
+            amount=Decimal("100.00"),
+            type="deposit",
+            account_id=new_account.id
+        )
+        session.add(initial_transaction)
+        
+        print("Commit des changements...")
+        session.commit()
+        session.refresh(new_user)
+        session.refresh(new_account)
+        
+        print("Inscription réussie!")
         return UserResponse(
-            id=db_user.id,
-            email=db_user.email,
+            id=new_user.id,
+            email=new_user.email,
             accounts=[
                 BankAccountResponse(
-                    id=bank_account.id,
-                    account_type=bank_account.account_type,
-                    balance=bank_account.balance,
-                    iban=bank_account.iban,
-                    created_at=bank_account.created_at,
-                    transactions=[]
+                    id=new_account.id,
+                    account_type=new_account.account_type,
+                    balance=new_account.balance,
+                    iban=new_account.iban,
+                    created_at=new_account.created_at,
+                    transactions=[
+                        TransactionResponse(
+                            id=initial_transaction.id,
+                            amount=initial_transaction.amount,
+                            type=initial_transaction.type,
+                            created_at=initial_transaction.created_at
+                        )
+                    ]
                 )
             ]
         )
-    except HTTPException as e:
+        
+    except HTTPException as http_error:
+        print(f"Erreur HTTP: {http_error.detail}")
         session.rollback()
-        raise e
+        raise http_error
     except Exception as e:
+        print(f"Erreur inattendue: {str(e)}")
+        print(f"Type d'erreur: {type(e)}")
         session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
