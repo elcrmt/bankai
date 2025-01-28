@@ -150,13 +150,13 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI()
 
-# Configuration CORS
+# Configurer CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],  # Autoriser le frontend React
     allow_credentials=True,
     allow_methods=["*"],  # Autoriser toutes les méthodes HTTP
-    allow_headers=["*"],  # Autoriser tous les headers
+    allow_headers=["*"],  # Autoriser tous les en-têtes
 )
 
 @app.on_event("startup")
@@ -1170,6 +1170,177 @@ async def delete_beneficiary(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors de la suppression du bénéficiaire: {str(e)}"
         )
+
+@app.get("/transactions", response_model=List[TransactionResponse])
+async def get_transactions(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    # Récupérer tous les comptes de l'utilisateur
+    accounts = session.query(BankAccount).filter(BankAccount.user_id == current_user.id).all()
+    account_ids = [account.id for account in accounts]
+    
+    # Récupérer toutes les transactions pour ces comptes
+    transactions = (
+        session.query(Transaction)
+        .filter(Transaction.account_id.in_(account_ids))
+        .order_by(Transaction.created_at.desc())
+        .all()
+    )
+    
+    # Calculer le solde total et en attente
+    total_balance = sum(account.balance for account in accounts)
+    pending_balance = sum(
+        transaction.amount
+        for transaction in transactions
+        if transaction.type == 'transfer_sent' and transaction.can_cancel_until is not None
+    )
+    
+    # Formater les transactions pour la réponse
+    transactions_data = [
+        TransactionResponse(
+            id=t.id,
+            amount=t.amount,
+            type=t.type,
+            created_at=t.created_at,
+            can_cancel_until=t.can_cancel_until
+        )
+        for t in transactions
+    ]
+    
+    return transactions_data
+
+@app.get("/api/accounts/summary")
+async def get_accounts_summary(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    # Récupérer tous les comptes de l'utilisateur
+    accounts = session.query(BankAccount).filter(
+        BankAccount.user_id == current_user.id,
+        BankAccount.closed_at.is_(None)  # Seulement les comptes actifs
+    ).all()
+    
+    # Calculer le solde total
+    total_balance = sum(account.balance for account in accounts)
+    
+    # Récupérer les transactions en attente
+    pending_transactions = session.query(Transaction).filter(
+        Transaction.account_id.in_([account.id for account in accounts]),
+        Transaction.type == 'transfer_sent',
+        Transaction.can_cancel_until.isnot(None)
+    ).all()
+    
+    # Calculer le montant en attente
+    pending_amount = sum(t.amount for t in pending_transactions)
+    
+    # Récupérer les dernières transactions
+    recent_transactions = (
+        session.query(Transaction)
+        .filter(Transaction.account_id.in_([account.id for account in accounts]))
+        .order_by(Transaction.created_at.desc())
+        .limit(10)
+        .all()
+    )
+    
+    transactions_data = [
+        {
+            "id": t.id,
+            "amount": t.amount,
+            "type": t.type,
+            "description": (
+                "Virement reçu" if t.type == "transfer_received"
+                else "Virement envoyé" if t.type == "transfer_sent"
+                else "Paiement carte"
+            ),
+            "date": t.created_at.isoformat(),
+            "status": "pending" if t.can_cancel_until else "completed"
+        }
+        for t in recent_transactions
+    ]
+    
+    accounts_data = [
+        {
+            "id": account.id,
+            "name": "Compte courant" if account.account_type == "current" else "Compte épargne",
+            "balance": account.balance,
+            "iban": account.iban
+        }
+        for account in accounts
+    ]
+    
+    return {
+        "total_balance": total_balance,
+        "pending_amount": pending_amount,
+        "accounts": accounts_data,
+        "recent_transactions": transactions_data
+    }
+
+@app.get("/api/transactions/search")
+async def search_transactions(
+    account_id: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    search_query: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    # Construire la requête de base
+    query = session.query(Transaction)
+    
+    # Filtrer par utilisateur
+    accounts = session.query(BankAccount).filter(
+        BankAccount.user_id == current_user.id,
+        BankAccount.closed_at.is_(None)
+    ).all()
+    account_ids = [account.id for account in accounts]
+    query = query.filter(Transaction.account_id.in_(account_ids))
+    
+    # Filtrer par compte si spécifié
+    if account_id and account_id != 'all':
+        query = query.filter(Transaction.account_id == account_id)
+    
+    # Filtrer par type de transaction
+    if transaction_type:
+        if transaction_type == 'income':
+            query = query.filter(Transaction.type == 'transfer_received')
+        elif transaction_type == 'expense':
+            query = query.filter(Transaction.type.in_(['transfer_sent', 'card_payment']))
+    
+    # Recherche par montant ou libellé
+    if search_query:
+        # Convertir la recherche en nombre si possible pour chercher dans les montants
+        try:
+            amount_search = float(search_query.replace(',', '.'))
+            query = query.filter(Transaction.amount == amount_search)
+        except ValueError:
+            # Si ce n'est pas un montant, chercher dans la description
+            search_pattern = f"%{search_query}%"
+            query = query.filter(Transaction.description.ilike(search_pattern))
+    
+    # Trier par date décroissante
+    query = query.order_by(Transaction.created_at.desc())
+    
+    # Exécuter la requête
+    transactions = query.all()
+    
+    # Formater les résultats
+    transactions_data = [
+        {
+            "id": t.id,
+            "amount": t.amount,
+            "type": t.type,
+            "description": (
+                "Virement reçu" if t.type == "transfer_received"
+                else "Virement envoyé" if t.type == "transfer_sent"
+                else "Paiement carte"
+            ),
+            "date": t.created_at.isoformat(),
+            "status": "pending" if t.can_cancel_until else "completed"
+        }
+        for t in transactions
+    ]
+    
+    return transactions_data
 
 async def check_account_not_closed(account: BankAccount):
     if account.closed_at:
