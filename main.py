@@ -111,6 +111,7 @@ class BankAccountResponse(BaseModel):
     balance: Decimal
     iban: str
     created_at: datetime
+    closed_at: Optional[datetime] = None
     transactions: List[TransactionResponse] = []
 
 class UserResponse(BaseModel):
@@ -145,6 +146,10 @@ class InternalTransferCreate(BaseModel):
     source_account_id: int
     destination_account_id: int
     amount: condecimal(gt=Decimal("0.00"), decimal_places=2)
+
+class ChangePassword(BaseModel):
+    current_password: str
+    new_password: str
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -325,6 +330,7 @@ def register_user(user: UserCreate, session: Session = Depends(get_session)):
                     balance=new_account.balance,
                     iban=new_account.iban,
                     created_at=new_account.created_at,
+                    closed_at=new_account.closed_at,
                     transactions=[
                         TransactionResponse(
                             id=initial_transaction.id,
@@ -400,6 +406,7 @@ async def read_users_me(
                 balance=account.balance,
                 iban=account.iban,
                 created_at=account.created_at,
+                closed_at=account.closed_at,
                 transactions=[t for t in enriched_transactions if t.id in [t.id for t in account.transactions]]
             ) for account in accounts
         ]
@@ -433,6 +440,7 @@ def list_users(session: Session = Depends(get_session)):
                         balance=user.account.balance,
                         iban=user.account.iban,
                         created_at=user.account.created_at,
+                        closed_at=user.account.closed_at,
                         transactions=enriched_transactions
                     )
                 )
@@ -455,33 +463,37 @@ def list_users(session: Session = Depends(get_session)):
         )
 
 @app.post("/account", response_model=BankAccountResponse)
-async def create_account(
+def create_account(
     account: BankAccountCreate,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session)
 ):
     try:
-        # Vérifier si l'utilisateur a déjà un compte de ce type
-        existing_account = (
+        # Vérifier si l'utilisateur a déjà un compte principal
+        existing_principal = (
             session.query(BankAccount)
             .filter(
                 BankAccount.user_id == current_user.id,
-                BankAccount.account_type == account.account_type
+                BankAccount.account_type == "principal",
+                BankAccount.closed_at.is_(None)
             )
             .first()
         )
         
-        if existing_account:
+        if account.account_type == "principal" and existing_principal:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Vous avez déjà un compte de type {account.account_type}"
+                detail="Vous avez déjà un compte principal"
             )
         
+        # Créer le nouveau compte
         new_account = BankAccount(
-            account_type=account.account_type,
             user_id=current_user.id,
-            iban=generate_iban()
+            account_type=account.account_type,
+            iban=generate_iban(),
+            balance=Decimal("0.00")
         )
+        
         session.add(new_account)
         session.commit()
         session.refresh(new_account)
@@ -492,13 +504,13 @@ async def create_account(
             balance=new_account.balance,
             iban=new_account.iban,
             created_at=new_account.created_at,
+            closed_at=new_account.closed_at,
             transactions=[]
         )
     except HTTPException as he:
         raise he
     except Exception as e:
         session.rollback()
-        print(f"Erreur lors de la création du compte: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors de la création du compte: {str(e)}"
@@ -545,6 +557,7 @@ async def deposit_money(
                     balance=account.balance,
                     iban=account.iban,
                     created_at=account.created_at,
+                    closed_at=account.closed_at,
                     transactions=[
                         TransactionResponse(
                             id=t.id,
@@ -887,6 +900,7 @@ async def internal_transfer(
                     balance=account.balance,
                     iban=account.iban,
                     created_at=account.created_at,
+                    closed_at=account.closed_at,
                     transactions=[
                         TransactionResponse(
                             id=t.id,
@@ -1029,6 +1043,7 @@ async def close_account(
                     balance=main_account.balance,
                     iban=main_account.iban,
                     created_at=main_account.created_at,
+                    closed_at=main_account.closed_at,
                     transactions=enriched_transactions
                 )
             ]
@@ -1348,3 +1363,22 @@ async def check_account_not_closed(account: BankAccount):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Ce compte est clôturé et ne peut plus être utilisé pour des transactions"
         )
+
+@app.post("/change-password")
+async def change_password(
+    password_data: ChangePassword,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    # Vérifier le mot de passe actuel
+    if not pwd_context.verify(password_data.current_password, current_user.password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mot de passe actuel incorrect"
+        )
+    
+    # Hasher et enregistrer le nouveau mot de passe
+    current_user.password = pwd_context.hash(password_data.new_password)
+    session.commit()
+    
+    return {"message": "Mot de passe modifié avec succès"}
