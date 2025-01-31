@@ -7,10 +7,12 @@ from pydantic import EmailStr, BaseModel, condecimal
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
-import os
 from typing import Optional, List
 from decimal import Decimal
 import random
+import string
+from fastapi.middleware.cors import CORSMiddleware
+import os
 
 # Configuration de la base de données
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -99,7 +101,10 @@ class TransactionResponse(BaseModel):
     type: str
     created_at: datetime
     can_cancel_until: Optional[datetime] = None
-    other_account_email: Optional[str] = None  # Email de l'autre compte impliqué
+    source_account_name: Optional[str] = None
+    source_iban: Optional[str] = None
+    recipient_account_name: Optional[str] = None
+    recipient_iban: Optional[str] = None
 
 class BankAccountCreate(BaseModel):
     account_type: str = Field(default="principal")
@@ -110,6 +115,7 @@ class BankAccountResponse(BaseModel):
     balance: Decimal
     iban: str
     created_at: datetime
+    closed_at: Optional[datetime] = None
     transactions: List[TransactionResponse] = []
 
 class UserResponse(BaseModel):
@@ -145,9 +151,37 @@ class InternalTransferCreate(BaseModel):
     destination_account_id: int
     amount: condecimal(gt=Decimal("0.00"), decimal_places=2)
 
+class ChangePassword(BaseModel):
+    current_password: str
+    new_password: str
+
+def generate_iban():
+    # Code pays (FR) + clé (2 chiffres) + code banque (5 chiffres) + code guichet (5 chiffres) + numéro de compte (11 chiffres) + clé RIB (2 chiffres)
+    country_code = "FR"
+    check_digits = str(random.randint(10, 99))
+    bank_code = "30004"  # Code BNP Paribas
+    branch_code = str(random.randint(10000, 99999))
+    account_number = ''.join(random.choices(string.digits, k=11))
+    
+    # Calcul de la clé RIB (simplifié pour l'exemple)
+    rib_key = str(random.randint(10, 99))
+    
+    iban = f"{country_code}{check_digits}{bank_code}{branch_code}{account_number}{rib_key}"
+    # Formatage de l'IBAN avec des espaces tous les 4 caractères
+    return ' '.join(iban[i:i+0] for i in range(0, len(iban), 0))
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI()
+
+# Configurer CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Autoriser le frontend React
+    allow_credentials=True,
+    allow_methods=["*"],  # Autoriser toutes les méthodes HTTP
+    allow_headers=["*"],  # Autoriser tous les en-têtes
+)
 
 @app.on_event("startup")
 async def on_startup():
@@ -191,112 +225,139 @@ async def get_current_user(token: str = Depends(oauth2_scheme), session: Session
 def get_enriched_transactions(session: Session, transactions: List[Transaction], current_user_email: str) -> List[TransactionResponse]:
     enriched_transactions = []
     for t in transactions:
-        other_email = None
-        if t.type == "withdrawal":
-            # Pour un retrait (transfert envoyé), chercher la transaction de dépôt correspondante
-            related_deposit = (
-                session.query(Transaction)
-                .join(BankAccount)
-                .join(User)
-                .filter(
-                    Transaction.type == "deposit",
-                    Transaction.amount == t.amount,
-                    Transaction.created_at == t.created_at
-                )
-                .with_entities(User.email)
-                .first()
-            )
-            if related_deposit:
-                other_email = related_deposit[0]
-        elif t.type == "deposit":
-            # Pour un dépôt (transfert reçu), chercher la transaction de retrait correspondante
-            related_withdrawal = (
-                session.query(Transaction)
-                .join(BankAccount)
-                .join(User)
-                .filter(
-                    Transaction.type == "withdrawal",
-                    Transaction.amount == t.amount,
-                    Transaction.created_at == t.created_at
-                )
-                .with_entities(User.email)
-                .first()
-            )
-            if related_withdrawal:
-                other_email = related_withdrawal[0]
+        # Récupérer les informations du compte source
+        source_account = session.query(BankAccount).filter(BankAccount.id == t.account_id).first()
+        source_user = session.query(User).filter(User.id == source_account.user_id).first()
         
-        enriched_transactions.append(
-            TransactionResponse(
-                id=t.id,
-                amount=t.amount,
-                type=t.type,
-                created_at=t.created_at,
-                other_account_email=other_email
+        # Initialiser les informations du destinataire
+        recipient_account = None
+        recipient_user = None
+        
+        # Pour les virements, chercher la transaction liée
+        if t.type in ['transfer_sent', 'transfer_received'] and t.related_transaction_id:
+            related_transaction = (
+                session.query(Transaction)
+                .filter(Transaction.id == t.related_transaction_id)
+                .first()
             )
+            if related_transaction:
+                recipient_account = (
+                    session.query(BankAccount)
+                    .filter(BankAccount.id == related_transaction.account_id)
+                    .first()
+                )
+                if recipient_account:
+                    recipient_user = (
+                        session.query(User)
+                        .filter(User.id == recipient_account.user_id)
+                        .first()
+                    )
+        
+        # Créer la réponse enrichie
+        enriched_transaction = TransactionResponse(
+            id=t.id,
+            amount=t.amount,
+            type=t.type,
+            created_at=t.created_at,
+            can_cancel_until=t.can_cancel_until,
+            source_account_name=f"{source_account.account_type} de {source_user.email}" if source_account and source_user else None,
+            source_iban=source_account.iban if source_account else None,
+            recipient_account_name=f"{recipient_account.account_type} de {recipient_user.email}" if recipient_account and recipient_user else None,
+            recipient_iban=recipient_account.iban if recipient_account else None
         )
-    return enriched_transactions
-
-def generate_iban():
-    country_code = "FR"
-    check_digits = str(random.randint(10, 99))
-    bank_code = "12345"  # Code banque fixe pour notre banque
-    branch_code = str(random.randint(10000, 99999))
-    account_number = ''.join([str(random.randint(0, 9)) for _ in range(11)])
-    rib_key = str(random.randint(10, 99))
+        enriched_transactions.append(enriched_transaction)
     
-    return f"{country_code}{check_digits}{bank_code}{branch_code}{account_number}{rib_key}"
+    return enriched_transactions
 
 @app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register_user(user: UserCreate, session: Session = Depends(get_session)):
     try:
+        print(f"Tentative d'inscription pour l'email: {user.email}")
+        
         # Vérifier si l'email existe déjà
-        if session.query(User).filter(User.email == user.email).first():
+        existing_user = session.query(User).filter(User.email == user.email).first()
+        if existing_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Un utilisateur avec cet email existe déjà"
+                detail="Cet email est déjà utilisé"
             )
         
+        print("Hachage du mot de passe...")
         # Hasher le mot de passe
         hashed_password = pwd_context.hash(user.password)
         
-        # Créer l'utilisateur
-        db_user = User(
+        print("Création de l'utilisateur...")
+        # Créer le nouvel utilisateur
+        new_user = User(
             email=user.email,
             password=hashed_password
         )
-        session.add(db_user)
-        session.commit()
-        session.refresh(db_user)
+        session.add(new_user)
+        session.flush()  # Pour obtenir l'ID de l'utilisateur
         
-        # Créer le compte bancaire principal avec IBAN
-        bank_account = BankAccount(
-            user_id=db_user.id,
+        print(f"Utilisateur créé avec l'ID: {new_user.id}")
+        print("Création du compte bancaire...")
+        
+        # Créer un compte principal avec 100€
+        iban = generate_iban()
+        print(f"IBAN généré: {iban}")
+        
+        new_account = BankAccount(
             account_type="principal",
             balance=Decimal("100.00"),
-            iban=generate_iban()
+            iban=iban,
+            user_id=new_user.id
         )
-        session.add(bank_account)
-        session.commit()
-        session.refresh(bank_account)
+        session.add(new_account)
+        session.flush()
         
+        print(f"Compte bancaire créé avec l'ID: {new_account.id}")
+        print("Création de la transaction initiale...")
+        
+        # Créer une transaction initiale pour le solde de 100€
+        initial_transaction = Transaction(
+            amount=Decimal("100.00"),
+            type="deposit",
+            account_id=new_account.id
+        )
+        session.add(initial_transaction)
+        
+        print("Commit des changements...")
+        session.commit()
+        session.refresh(new_user)
+        session.refresh(new_account)
+        
+        print("Inscription réussie!")
         return UserResponse(
-            id=db_user.id,
-            email=db_user.email,
+            id=new_user.id,
+            email=new_user.email,
             accounts=[
                 BankAccountResponse(
-                    id=bank_account.id,
-                    account_type=bank_account.account_type,
-                    balance=bank_account.balance,
-                    iban=bank_account.iban,
-                    created_at=bank_account.created_at,
-                    transactions=[]
+                    id=new_account.id,
+                    account_type=new_account.account_type,
+                    balance=new_account.balance,
+                    iban=new_account.iban,
+                    created_at=new_account.created_at,
+                    closed_at=new_account.closed_at,
+                    transactions=[
+                        TransactionResponse(
+                            id=initial_transaction.id,
+                            amount=initial_transaction.amount,
+                            type=initial_transaction.type,
+                            created_at=initial_transaction.created_at
+                        )
+                    ]
                 )
             ]
         )
-    except HTTPException as e:
+        
+    except HTTPException as http_error:
+        print(f"Erreur HTTP: {http_error.detail}")
         session.rollback()
-        raise e
+        raise http_error
     except Exception as e:
+        print(f"Erreur inattendue: {str(e)}")
+        print(f"Type d'erreur: {type(e)}")
         session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -353,6 +414,7 @@ async def read_users_me(
                 balance=account.balance,
                 iban=account.iban,
                 created_at=account.created_at,
+                closed_at=account.closed_at,
                 transactions=[t for t in enriched_transactions if t.id in [t.id for t in account.transactions]]
             ) for account in accounts
         ]
@@ -386,6 +448,7 @@ def list_users(session: Session = Depends(get_session)):
                         balance=user.account.balance,
                         iban=user.account.iban,
                         created_at=user.account.created_at,
+                        closed_at=user.account.closed_at,
                         transactions=enriched_transactions
                     )
                 )
@@ -407,51 +470,35 @@ def list_users(session: Session = Depends(get_session)):
             detail=f"Erreur lors de la récupération des utilisateurs: {str(e)}"
         )
 
-@app.post("/account", response_model=BankAccountResponse)
+@app.post("/account", response_model=dict)
 async def create_account(
     account: BankAccountCreate,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session)
 ):
     try:
-        # Vérifier si l'utilisateur a déjà un compte de ce type
-        existing_account = (
-            session.query(BankAccount)
-            .filter(
-                BankAccount.user_id == current_user.id,
-                BankAccount.account_type == account.account_type
-            )
-            .first()
-        )
-        
-        if existing_account:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Vous avez déjà un compte de type {account.account_type}"
-            )
-        
         new_account = BankAccount(
-            account_type=account.account_type,
             user_id=current_user.id,
+            account_type=account.account_type,
+            balance=0,
             iban=generate_iban()
         )
+        
         session.add(new_account)
         session.commit()
         session.refresh(new_account)
         
-        return BankAccountResponse(
-            id=new_account.id,
-            account_type=new_account.account_type,
-            balance=new_account.balance,
-            iban=new_account.iban,
-            created_at=new_account.created_at,
-            transactions=[]
-        )
-    except HTTPException as he:
-        raise he
+        return {
+            "message": "Compte créé avec succès",
+            "account": {
+                "id": new_account.id,
+                "account_type": new_account.account_type,
+                "balance": new_account.balance,
+                "iban": new_account.iban
+            }
+        }
     except Exception as e:
         session.rollback()
-        print(f"Erreur lors de la création du compte: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors de la création du compte: {str(e)}"
@@ -498,6 +545,7 @@ async def deposit_money(
                     balance=account.balance,
                     iban=account.iban,
                     created_at=account.created_at,
+                    closed_at=account.closed_at,
                     transactions=[
                         TransactionResponse(
                             id=t.id,
@@ -597,9 +645,14 @@ async def transfer_money(
         session.refresh(debit_transaction)
         session.refresh(credit_transaction)
         
-        # Lier les transactions
+        # Lier les transactions dans les deux sens
+        debit_transaction.related_transaction_id = credit_transaction.id
         credit_transaction.related_transaction_id = debit_transaction.id
         session.commit()
+        
+        # Enrichir les transactions pour la réponse
+        source_user = session.query(User).filter(User.id == source_account.user_id).first()
+        recipient_user = session.query(User).filter(User.id == recipient_account.user_id).first()
         
         # Vérifier que les comptes ne sont pas clôturés
         await check_account_not_closed(source_account)
@@ -611,13 +664,21 @@ async def transfer_money(
                 amount=debit_transaction.amount,
                 type=debit_transaction.type,
                 created_at=debit_transaction.created_at,
-                can_cancel_until=debit_transaction.can_cancel_until
+                can_cancel_until=debit_transaction.can_cancel_until,
+                source_account_name=f"{source_account.account_type} de {source_user.email}",
+                source_iban=source_account.iban,
+                recipient_account_name=f"{recipient_account.account_type} de {recipient_user.email}",
+                recipient_iban=recipient_account.iban
             ),
             TransactionResponse(
                 id=credit_transaction.id,
                 amount=credit_transaction.amount,
                 type=credit_transaction.type,
-                created_at=credit_transaction.created_at
+                created_at=credit_transaction.created_at,
+                source_account_name=f"{source_account.account_type} de {source_user.email}",
+                source_iban=source_account.iban,
+                recipient_account_name=f"{recipient_account.account_type} de {recipient_user.email}",
+                recipient_iban=recipient_account.iban
             )
         ]
         
@@ -840,6 +901,7 @@ async def internal_transfer(
                     balance=account.balance,
                     iban=account.iban,
                     created_at=account.created_at,
+                    closed_at=account.closed_at,
                     transactions=[
                         TransactionResponse(
                             id=t.id,
@@ -856,7 +918,6 @@ async def internal_transfer(
         raise he
     except Exception as e:
         session.rollback()
-        print(f"Erreur lors du transfert interne: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors du transfert interne: {str(e)}"
@@ -982,6 +1043,7 @@ async def close_account(
                     balance=main_account.balance,
                     iban=main_account.iban,
                     created_at=main_account.created_at,
+                    closed_at=main_account.closed_at,
                     transactions=enriched_transactions
                 )
             ]
@@ -1124,9 +1186,260 @@ async def delete_beneficiary(
             detail=f"Erreur lors de la suppression du bénéficiaire: {str(e)}"
         )
 
+@app.get("/transactions", response_model=dict)
+async def get_transactions(
+    current_user: User = Depends(get_current_user),
+    account_type: Optional[str] = None,
+    session: Session = Depends(get_session)
+):
+    try:
+        # Construire la requête de base pour les comptes
+        accounts_query = session.query(BankAccount).filter(BankAccount.user_id == current_user.id)
+        
+        # Filtrer par type de compte si spécifié
+        if account_type and account_type != "all":
+            accounts_query = accounts_query.filter(BankAccount.account_type == account_type)
+        
+        # Récupérer les comptes filtrés
+        accounts = accounts_query.all()
+        account_ids = [account.id for account in accounts]
+        
+        # Calculer le solde total et en attente pour les comptes filtrés
+        total_balance = sum(account.balance for account in accounts)
+        pending_amount = sum(
+            transaction.amount
+            for account in accounts
+            for transaction in account.transactions
+            if transaction.type == 'transfer_sent' and transaction.can_cancel_until is not None
+            and transaction.can_cancel_until > datetime.utcnow()
+        )
+        
+        # Récupérer toutes les transactions pour ces comptes avec les relations
+        transactions = (
+            session.query(Transaction)
+            .join(BankAccount)
+            .join(User)
+            .filter(Transaction.account_id.in_(account_ids))
+            .order_by(Transaction.created_at.desc())
+            .all()
+        )
+
+        # Enrichir les transactions avec les informations des comptes
+        enriched_transactions = []
+        for transaction in transactions:
+            # Récupérer les informations du compte source
+            source_account = session.query(BankAccount).filter(BankAccount.id == transaction.account_id).first()
+            source_user = session.query(User).filter(User.id == source_account.user_id).first()
+
+            # Initialiser les informations du compte destinataire
+            recipient_account = None
+            recipient_user = None
+
+            # Pour les virements, récupérer les informations du compte lié
+            if transaction.type in ['transfer_sent', 'transfer_received'] and transaction.related_transaction_id:
+                related_transaction = (
+                    session.query(Transaction)
+                    .filter(Transaction.id == transaction.related_transaction_id)
+                    .first()
+                )
+                if related_transaction:
+                    # Si c'est un virement envoyé, le destinataire est le compte de la transaction liée
+                    # Si c'est un virement reçu, la source est le compte de la transaction liée
+                    related_account = session.query(BankAccount).filter(BankAccount.id == related_transaction.account_id).first()
+                    if related_account:
+                        related_user = session.query(User).filter(User.id == related_account.user_id).first()
+                        if transaction.type == 'transfer_sent':
+                            recipient_account = related_account
+                            recipient_user = related_user
+                        else:  # transfer_received
+                            # Inverser source et destinataire pour les virements reçus
+                            recipient_account = source_account
+                            recipient_user = source_user
+                            source_account = related_account
+                            source_user = related_user
+
+            # Créer la réponse enrichie
+            enriched_transaction = TransactionResponse(
+                id=transaction.id,
+                amount=transaction.amount,
+                type=transaction.type,
+                created_at=transaction.created_at,
+                can_cancel_until=transaction.can_cancel_until,
+                source_account_name=f"{source_account.account_type} de {source_user.email}" if source_account and source_user else None,
+                source_iban=source_account.iban if source_account else None,
+                recipient_account_name=f"{recipient_account.account_type} de {recipient_user.email}" if recipient_account and recipient_user else None,
+                recipient_iban=recipient_account.iban if recipient_account else None
+            )
+            enriched_transactions.append(enriched_transaction)
+
+        return {
+            "transactions": enriched_transactions,
+            "total_balance": total_balance,
+            "pending_amount": pending_amount,
+            "account_type": account_type or "all"
+        }
+
+    except Exception as e:
+        print(f"Erreur lors de la récupération des transactions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors de la récupération des transactions: {str(e)}"
+        )
+
+@app.get("/api/accounts/summary")
+async def get_accounts_summary(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    # Récupérer tous les comptes de l'utilisateur
+    accounts = session.query(BankAccount).filter(
+        BankAccount.user_id == current_user.id,
+        BankAccount.closed_at.is_(None)  # Seulement les comptes actifs
+    ).all()
+    
+    # Calculer le solde total
+    total_balance = sum(account.balance for account in accounts)
+    
+    # Récupérer les transactions en attente
+    pending_transactions = session.query(Transaction).filter(
+        Transaction.account_id.in_([account.id for account in accounts]),
+        Transaction.type == 'transfer_sent',
+        Transaction.can_cancel_until.isnot(None)
+    ).all()
+    
+    # Calculer le montant en attente
+    pending_amount = sum(t.amount for t in pending_transactions)
+    
+    # Récupérer les dernières transactions
+    recent_transactions = (
+        session.query(Transaction)
+        .filter(Transaction.account_id.in_([account.id for account in accounts]))
+        .order_by(Transaction.created_at.desc())
+        .limit(10)
+        .all()
+    )
+    
+    transactions_data = [
+        {
+            "id": t.id,
+            "amount": t.amount,
+            "type": t.type,
+            "description": (
+                "Virement reçu" if t.type == "transfer_received"
+                else "Virement envoyé" if t.type == "transfer_sent"
+                else "Paiement carte"
+            ),
+            "date": t.created_at.isoformat(),
+            "status": "pending" if t.can_cancel_until else "completed"
+        }
+        for t in recent_transactions
+    ]
+    
+    accounts_data = [
+        {
+            "id": account.id,
+            "name": "Compte courant" if account.account_type == "current" else "Compte épargne",
+            "balance": account.balance,
+            "iban": account.iban
+        }
+        for account in accounts
+    ]
+    
+    return {
+        "total_balance": total_balance,
+        "pending_amount": pending_amount,
+        "accounts": accounts_data,
+        "recent_transactions": transactions_data
+    }
+
+@app.get("/api/transactions/search")
+async def search_transactions(
+    account_id: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    search_query: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    # Construire la requête de base
+    query = session.query(Transaction)
+    
+    # Filtrer par utilisateur
+    accounts = session.query(BankAccount).filter(
+        BankAccount.user_id == current_user.id,
+        BankAccount.closed_at.is_(None)
+    ).all()
+    account_ids = [account.id for account in accounts]
+    query = query.filter(Transaction.account_id.in_(account_ids))
+    
+    # Filtrer par compte si spécifié
+    if account_id and account_id != 'all':
+        query = query.filter(Transaction.account_id == account_id)
+    
+    # Filtrer par type de transaction
+    if transaction_type:
+        if transaction_type == 'income':
+            query = query.filter(Transaction.type == 'transfer_received')
+        elif transaction_type == 'expense':
+            query = query.filter(Transaction.type.in_(['transfer_sent', 'card_payment']))
+    
+    # Recherche par montant ou libellé
+    if search_query:
+        # Convertir la recherche en nombre si possible pour chercher dans les montants
+        try:
+            amount_search = float(search_query.replace(',', '.'))
+            query = query.filter(Transaction.amount == amount_search)
+        except ValueError:
+            # Si ce n'est pas un montant, chercher dans la description
+            search_pattern = f"%{search_query}%"
+            query = query.filter(Transaction.description.ilike(search_pattern))
+    
+    # Trier par date décroissante
+    query = query.order_by(Transaction.created_at.desc())
+    
+    # Exécuter la requête
+    transactions = query.all()
+    
+    # Formater les résultats
+    transactions_data = [
+        {
+            "id": t.id,
+            "amount": t.amount,
+            "type": t.type,
+            "description": (
+                "Virement reçu" if t.type == "transfer_received"
+                else "Virement envoyé" if t.type == "transfer_sent"
+                else "Paiement carte"
+            ),
+            "date": t.created_at.isoformat(),
+            "status": "pending" if t.can_cancel_until else "completed"
+        }
+        for t in transactions
+    ]
+    
+    return transactions_data
+
 async def check_account_not_closed(account: BankAccount):
     if account.closed_at:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Ce compte est clôturé et ne peut plus être utilisé pour des transactions"
         )
+
+@app.post("/change-password")
+async def change_password(
+    password_data: ChangePassword,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    # Vérifier le mot de passe actuel
+    if not pwd_context.verify(password_data.current_password, current_user.password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mot de passe actuel incorrect"
+        )
+    
+    # Hasher et enregistrer le nouveau mot de passe
+    current_user.password = pwd_context.hash(password_data.new_password)
+    session.commit()
+    
+    return {"message": "Mot de passe modifié avec succès"}
